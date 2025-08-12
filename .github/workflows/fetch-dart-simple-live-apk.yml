@@ -3,7 +3,7 @@ name: Fetch dart_simple_live ARM64 APK
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/1440 * * * *"
+    - cron: "0 0 * * *"
 
 concurrency:
   group: fetch-dart-simple-live-apk
