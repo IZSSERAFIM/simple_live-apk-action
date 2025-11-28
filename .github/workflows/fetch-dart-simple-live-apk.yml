@@ -1,36 +1,30 @@
 name: Fetch dart_simple_live ARM64 APK
-
 on:
   workflow_dispatch:
   schedule:
     - cron: "0 0 * * *"
-
 concurrency:
   group: fetch-dart-simple-live-apk
   cancel-in-progress: false
-
 env:
   UPSTREAM_OWNER: xiaoyaocz
   UPSTREAM_REPO: dart_simple_live
   WORKFLOW_FILE: publish_app_dev.yaml
   TARGET_ARTIFACT_NAME: android
   APK_FILENAME: app-arm64-v8a-release.apk
-  BRANCH: dev
-
+  BRANCH: dev  # 保留，但现在不用于 API 过滤
 jobs:
   fetch-and-release:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout (当前仓库)
         uses: actions/checkout@v4
-
       - name: 检查 UPSTREAM_TOKEN
         run: |
           if [ -z "${{ secrets.UPSTREAM_TOKEN }}" ]; then
             echo "缺少 secrets.UPSTREAM_TOKEN"
             exit 1
           fi
-
       - name: 获取上游最新成功运行
         id: probe
         uses: actions/github-script@v7
@@ -38,26 +32,31 @@ jobs:
           github-token: ${{ secrets.UPSTREAM_TOKEN }}
           script: |
             const upstreamOwner = process.env.UPSTREAM_OWNER;
-            const upstreamRepo  = process.env.UPSTREAM_REPO;
-            const workflowFile  = process.env.WORKFLOW_FILE;
-            const branch        = process.env.BRANCH;
+            const upstreamRepo = process.env.UPSTREAM_REPO;
+            const workflowFile = process.env.WORKFLOW_FILE;
+            // const branch = process.env.BRANCH;  // 不再使用 branch 过滤
             const targetArtifactName = process.env.TARGET_ARTIFACT_NAME;
-
             const runsResp = await github.rest.actions.listWorkflowRuns({
               owner: upstreamOwner,
               repo: upstreamRepo,
               workflow_id: workflowFile,
-              branch,
               status: 'success',
-              per_page: 1
+              per_page: 20  // 增加到 20 以获取更多运行
             });
             if (!runsResp.data.workflow_runs.length) {
               core.setOutput('skip', 'true');
               return;
             }
-            const run = runsResp.data.workflow_runs[0];
+            // 手动过滤 head_branch 以 'dev_v' 开头的运行（匹配上游标签触发）
+            let filteredRuns = runsResp.data.workflow_runs.filter(run => run.head_branch && run.head_branch.startsWith('dev_v'));
+            if (!filteredRuns.length) {
+              core.setOutput('skip', 'true');
+              return;
+            }
+            // 按 created_at 降序排序，取最新的
+            filteredRuns.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+            const run = filteredRuns[0];
             const runId = run.id;
-
             const artifactsResp = await github.rest.actions.listWorkflowRunArtifacts({
               owner: upstreamOwner,
               repo: upstreamRepo,
@@ -69,7 +68,6 @@ jobs:
               core.setOutput('skip', 'true');
               return;
             }
-
             const releaseTag = `dart-simple-live-dev-run-${runId}`;
             try {
               await github.rest.repos.getReleaseByTag({
@@ -80,17 +78,14 @@ jobs:
               core.setOutput('skip', 'true');
               return;
             } catch (e) {}
-
             core.setOutput('skip', 'false');
             core.setOutput('run_id', String(runId));
             core.setOutput('artifact_id', String(artifact.id));
             core.setOutput('release_tag', releaseTag);
             core.setOutput('upstream_html_url', run.html_url);
-
       - name: 跳过
         if: steps.probe.outputs.skip == 'true'
         run: echo "No new run."
-
       - name: 下载 Artifact ZIP
         if: steps.probe.outputs.skip != 'true'
         run: |
@@ -99,7 +94,6 @@ jobs:
                -o android_artifact.zip \
                "https://api.github.com/repos/${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }}/actions/artifacts/${{ steps.probe.outputs.artifact_id }}/zip"
           ls -lh android_artifact.zip
-
       - name: 解压并提取 ARM64 APK
         id: extract
         if: steps.probe.outputs.skip != 'true'
@@ -109,22 +103,18 @@ jobs:
             unzip -q android_artifact.zip -d artifact_contents
           echo "解压后的文件列表:"
           find artifact_contents -maxdepth 4 -type f -printf "%P\n"
-
           APK_PATH=$(find artifact_contents -type f -name "${APK_FILENAME}" -print -quit || true)
           if [ -z "$APK_PATH" ]; then
             echo "未找到 ${APK_FILENAME}"
             exit 1
           fi
           echo "找到 APK: $APK_PATH"
-
           # 如果不在仓库根目录，复制一份
           if [ "$APK_PATH" != "./${APK_FILENAME}" ] && [ "$APK_PATH" != "${APK_FILENAME}" ]; then
             cp "$APK_PATH" "./${APK_FILENAME}"
           fi
           ls -lh "./${APK_FILENAME}"
-
           echo "apk_path=./${APK_FILENAME}" >> $GITHUB_OUTPUT
-
       - name: 生成 SHA256
         id: digest
         if: steps.probe.outputs.skip != 'true'
@@ -132,7 +122,6 @@ jobs:
           sha256sum "${{ env.APK_FILENAME }}" > "${{ env.APK_FILENAME }}.sha256"
           cat "${{ env.APK_FILENAME }}.sha256"
           echo "sha256_file=${{ env.APK_FILENAME }}.sha256" >> $GITHUB_OUTPUT
-
       - name: 发布 Release
         if: steps.probe.outputs.skip != 'true'
         uses: softprops/action-gh-release@v2
@@ -145,10 +134,8 @@ jobs:
             分支: ${{ env.BRANCH }}
             Run ID: ${{ steps.probe.outputs.run_id }}
             上游运行: ${{ steps.probe.outputs.upstream_html_url }}
-
             文件:
             - ${{ env.APK_FILENAME }}
-
             SHA256:
             ```
             $(cat ${{ steps.digest.outputs.sha256_file }})
@@ -158,7 +145,6 @@ jobs:
             ${{ steps.digest.outputs.sha256_file }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       - name: 完成
         if: steps.probe.outputs.skip != 'true'
         run: echo "已发布 run ${{ steps.probe.outputs.run_id }} 的 APK。"
