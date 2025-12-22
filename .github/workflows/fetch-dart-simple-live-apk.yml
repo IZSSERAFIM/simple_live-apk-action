@@ -12,22 +12,20 @@ env:
   WORKFLOW_FILE: publish_app_dev.yaml
   TARGET_ARTIFACT_NAME: android
   APK_FILENAME: app-arm64-v8a-release.apk
-  BRANCH: dev  # 保留，但现在不用于 API 过滤
+  BRANCH: dev  # 策略1使用，策略2不使用
 jobs:
   fetch-and-release:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout (当前仓库)
         uses: actions/checkout@v4
-
       - name: 检查 UPSTREAM_TOKEN
         run: |
           if [ -z "${{ secrets.UPSTREAM_TOKEN }}" ]; then
             echo "缺少 secrets.UPSTREAM_TOKEN"
             exit 1
           fi
-
-      - name: 获取上游最新成功运行
+      - name: 获取上游最新成功运行（双策略）
         id: probe
         uses: actions/github-script@v7
         with:
@@ -38,50 +36,84 @@ jobs:
             const workflowFile = process.env.WORKFLOW_FILE;
             const targetArtifactName = process.env.TARGET_ARTIFACT_NAME;
 
-            const runsResp = await github.rest.actions.listWorkflowRuns({
+            // 策略1: 使用 branch: dev 参数
+            const runsResp1 = await github.rest.actions.listWorkflowRuns({
+              owner: upstreamOwner,
+              repo: upstreamRepo,
+              workflow_id: workflowFile,
+              branch: 'dev',
+              status: 'success',
+              per_page: 1
+            });
+            let run1 = null;
+            if (runsResp1.data.workflow_runs.length > 0) {
+              run1 = runsResp1.data.workflow_runs[0];
+              console.log(`策略1找到运行: ${run1.id}, 分支: ${run1.head_branch}, 时间: ${run1.created_at}`);
+            }
+
+            // 策略2: 不使用 branch 参数，手动过滤 dev_v*
+            const runsResp2 = await github.rest.actions.listWorkflowRuns({
               owner: upstreamOwner,
               repo: upstreamRepo,
               workflow_id: workflowFile,
               status: 'success',
               per_page: 20
             });
+            let run2 = null;
+            const filteredRuns = runsResp2.data.workflow_runs.filter(run => 
+              run.head_branch && run.head_branch.startsWith('dev_v')
+            );
+            if (filteredRuns.length > 0) {
+              filteredRuns.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+              run2 = filteredRuns[0];
+              console.log(`策略2找到运行: ${run2.id}, 分支: ${run2.head_branch}, 时间: ${run2.created_at}`);
+            }
 
-            if (!runsResp.data.workflow_runs.length) {
+            // 自动选择最新的运行
+            let selectedRun = null;
+            if (run1 && run2) {
+              selectedRun = new Date(run1.created_at) > new Date(run2.created_at) ? run1 : run2;
+              console.log(`两个策略都找到，选择较新的: ${selectedRun.id}`);
+            } else if (run1) {
+              selectedRun = run1;
+              console.log(`仅策略1找到运行: ${selectedRun.id}`);
+            } else if (run2) {
+              selectedRun = run2;
+              console.log(`仅策略2找到运行: ${selectedRun.id}`);
+            }
+
+            if (!selectedRun) {
+              console.log('未找到任何符合条件的运行');
               core.setOutput('skip', 'true');
               return;
             }
 
-            let filteredRuns = runsResp.data.workflow_runs.filter(run => run.head_branch && run.head_branch.startsWith('dev_v'));
-            if (!filteredRuns.length) {
-              core.setOutput('skip', 'true');
-              return;
-            }
+            const runId = selectedRun.id;
+            console.log(`使用运行 ID: ${runId}, 分支: ${selectedRun.head_branch}`);
 
-            filteredRuns.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-            const run = filteredRuns[0];
-            const runId = run.id;
-
+            // 获取 Artifact
             const artifactsResp = await github.rest.actions.listWorkflowRunArtifacts({
               owner: upstreamOwner,
               repo: upstreamRepo,
               run_id: runId,
               per_page: 100
             });
-
             const artifact = artifactsResp.data.artifacts.find(a => a.name === targetArtifactName);
             if (!artifact) {
+              console.log(`未找到 Artifact: ${targetArtifactName}`);
               core.setOutput('skip', 'true');
               return;
             }
 
+            // 检查是否已发布
             const releaseTag = `dart-simple-live-dev-run-${runId}`;
-
             try {
               await github.rest.repos.getReleaseByTag({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 tag: releaseTag
               });
+              console.log(`Release 已存在: ${releaseTag}`);
               core.setOutput('skip', 'true');
               return;
             } catch (e) {}
@@ -90,12 +122,11 @@ jobs:
             core.setOutput('run_id', String(runId));
             core.setOutput('artifact_id', String(artifact.id));
             core.setOutput('release_tag', releaseTag);
-            core.setOutput('upstream_html_url', run.html_url);
-
+            core.setOutput('upstream_html_url', selectedRun.html_url);
+            core.setOutput('branch_name', selectedRun.head_branch);
       - name: 跳过
         if: steps.probe.outputs.skip == 'true'
         run: echo "No new run."
-
       - name: 下载 Artifact ZIP
         if: steps.probe.outputs.skip != 'true'
         run: |
@@ -104,7 +135,6 @@ jobs:
                -o android_artifact.zip \
                "https://api.github.com/repos/${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }}/actions/artifacts/${{ steps.probe.outputs.artifact_id }}/zip"
           ls -lh android_artifact.zip
-
       - name: 解压并提取 ARM64 APK
         id: extract
         if: steps.probe.outputs.skip != 'true'
@@ -125,7 +155,6 @@ jobs:
           fi
           ls -lh "./${APK_FILENAME}"
           echo "apk_path=./${APK_FILENAME}" >> $GITHUB_OUTPUT
-
       - name: 生成 SHA256
         id: digest
         if: steps.probe.outputs.skip != 'true'
@@ -134,7 +163,6 @@ jobs:
           SHA256_VALUE=$(cat "${{ env.APK_FILENAME }}.sha256")
           echo "sha256_value=$SHA256_VALUE" >> $GITHUB_OUTPUT
           echo "sha256_file=${{ env.APK_FILENAME }}.sha256" >> $GITHUB_OUTPUT
-
       - name: 发布 Release
         if: steps.probe.outputs.skip != 'true'
         uses: softprops/action-gh-release@v2
@@ -144,7 +172,7 @@ jobs:
           body: |
             上游仓库: https://github.com/${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }}
             工作流: ${{ env.WORKFLOW_FILE }}
-            分支: ${{ env.BRANCH }}
+            分支: ${{ steps.probe.outputs.branch_name }}
             Run ID: ${{ steps.probe.outputs.run_id }}
             上游运行: ${{ steps.probe.outputs.upstream_html_url }}
             文件:
@@ -158,7 +186,6 @@ jobs:
             ${{ steps.digest.outputs.sha256_file }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       - name: 完成
         if: steps.probe.outputs.skip != 'true'
         run: echo "已发布 run ${{ steps.probe.outputs.run_id }} 的 APK。"
